@@ -2,6 +2,7 @@
 #include "monitor_file_utilities.h"
 
 #include <chrono>
+#include <numeric>
 
 #include <sstream>
 #include <type_traits>
@@ -344,34 +345,49 @@ namespace edm::service::tracer {
 
     const auto beginTime = TimingServiceBase::jobStartTime();
 
-    auto esModuleLabelsPtr = std::make_shared<std::vector<std::string>>();
+    auto esModuleLabelsPtr = std::make_shared<std::vector<std::pair<std::string, std::string>>>();
     auto& esModuleLabels = *esModuleLabelsPtr;
-    //acquire names for all the ED and ES modules
-    iRegistry.watchPostESModuleRegistration([&esModuleLabels](auto const& iDescription) {
-      if (esModuleLabels.size() <= iDescription.id_ + 1) {
-        esModuleLabels.resize(iDescription.id_ + 2);
-      }
-      //NOTE: we want the id to start at 1 not 0
-      if (not iDescription.label_.empty()) {
-        esModuleLabels[iDescription.id_ + 1] = iDescription.label_;
+    auto esmoduleCtrDtrPtr = std::make_shared<std::vector<ModuleCtrDtr>>();
+    auto& esmoduleCtrDtr = *esmoduleCtrDtrPtr;
+
+    iRegistry.watchPreESModuleConstruction([&esmoduleCtrDtr, &esModuleLabels, beginTime](auto const& md) {
+      auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
+
+      auto const mid = md.id_ + 1;  //NOTE: we want the id to start at 1 not 0
+      if (mid < esmoduleCtrDtr.size()) {
+        esmoduleCtrDtr[mid].beginConstruction = t;
       } else {
-        esModuleLabels[iDescription.id_ + 1] = iDescription.type_;
+        esmoduleCtrDtr.resize(mid + 1);
+        esmoduleCtrDtr.back().beginConstruction = t;
+      }
+      auto const* label = md.label_.empty() ? (&md.type_) : (&md.label_);
+      if (mid < esModuleLabels.size()) {
+        esModuleLabels[mid] = std::make_pair(*label, md.type_);
+      } else {
+        esModuleLabels.resize(mid + 1);
+        esModuleLabels.back() = std::make_pair(*label, md.type_);
       }
     });
+    iRegistry.watchPostESModuleConstruction([&esmoduleCtrDtr, beginTime](auto const& md) {
+      auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
+      esmoduleCtrDtr[md.id_ + 1].endConstruction = t;
+    });
+
+    //acquire names for all the ED and ES modules
     auto moduleCtrDtrPtr = std::make_shared<std::vector<ModuleCtrDtr>>();
     auto& moduleCtrDtr = *moduleCtrDtrPtr;
-    auto moduleLabelsPtr = std::make_shared<std::vector<std::string>>();
+    auto moduleLabelsPtr = std::make_shared<std::vector<std::pair<std::string, std::string>>>();
     auto& moduleLabels = *moduleLabelsPtr;
     iRegistry.watchPreModuleConstruction([&moduleLabels, &moduleCtrDtr, beginTime](ModuleDescription const& md) {
       auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
 
       auto const mid = md.id();
       if (mid < moduleLabels.size()) {
-        moduleLabels[mid] = md.moduleLabel();
+        moduleLabels[mid] = std::make_pair(md.moduleLabel(), md.moduleName());
         moduleCtrDtr[mid].beginConstruction = t;
       } else {
         moduleLabels.resize(mid + 1);
-        moduleLabels.back() = md.moduleLabel();
+        moduleLabels.back() = std::make_pair(md.moduleLabel(), md.moduleName());
         moduleCtrDtr.resize(mid + 1);
         moduleCtrDtr.back().beginConstruction = t;
       }
@@ -392,9 +408,12 @@ namespace edm::service::tracer {
 
     auto sourceCtrPtr = std::make_shared<ModuleCtrDtr>();
     auto& sourceCtr = *sourceCtrPtr;
-    iRegistry.watchPreSourceConstruction([&sourceCtr, beginTime](auto const&) {
+    auto sourceTypePtr = std::make_shared<std::string>();
+    auto& sourceType = *sourceTypePtr;
+    iRegistry.watchPreSourceConstruction([&sourceCtr, &sourceType, beginTime](auto const& md) {
       auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
       sourceCtr.beginConstruction = t;
+      sourceType = md.moduleName();
     });
     iRegistry.watchPostSourceConstruction([&sourceCtr, beginTime](auto const&) {
       auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
@@ -475,21 +494,33 @@ namespace edm::service::tracer {
                                 moduleLabelsPtr,
                                 esModuleLabelsPtr,
                                 moduleCtrDtrPtr,
+                                esmoduleCtrDtrPtr,
                                 sourceCtrPtr,
+                                sourceTypePtr,
                                 beginTime,
                                 pythonBegin,
                                 pythonEnd,
                                 servicesBegin,
                                 startupTimes](auto&) mutable {
+      if (!moduleLabelsPtr->empty()) {
+        (*moduleLabelsPtr)[0] = std::make_pair("source", *sourceTypePtr);
+      }
       {
         std::ostringstream oss;
-        moduleIdToLabel(oss, *moduleLabelsPtr, 'M', "EDModule ID", "Module label");
+        std::vector<std::pair<std::string, std::string>> nameType{{"source", *sourceTypePtr}};
+        moduleIdToLabel(oss, nameType, 'S', "Source ID", "Source label", "Source type");
+        logFile->write(oss.str());
+        sourceTypePtr.reset();
+      }
+      {
+        std::ostringstream oss;
+        moduleIdToLabel(oss, *moduleLabelsPtr, 'M', "EDModule ID", "Module label", "Module type");
         logFile->write(oss.str());
         moduleLabelsPtr.reset();
       }
       {
         std::ostringstream oss;
-        moduleIdToLabel(oss, *esModuleLabelsPtr, 'N', "ESModule ID", "ESModule label");
+        moduleIdToLabel(oss, *esModuleLabelsPtr, 'N', "ESModule ID", "ESModule label", "Module type");
         logFile->write(oss.str());
         esModuleLabelsPtr.reset();
       }
@@ -530,6 +561,38 @@ namespace edm::service::tracer {
         logFile->write(std::move(msg));
       }
       {
+        std::vector<int> indices(esmoduleCtrDtrPtr->size());
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&esmoduleCtrDtrPtr](int l, int r) {
+          return (*esmoduleCtrDtrPtr)[l].beginConstruction < (*esmoduleCtrDtrPtr)[r].beginConstruction;
+        });
+        for (auto index : indices) {
+          auto const& ctr = (*esmoduleCtrDtrPtr)[index];
+          if (ctr.beginConstruction != 0 and ctr.endConstruction != 0) {
+            auto msg = assembleMessage<Step::preESModule>(
+                static_cast<std::underlying_type_t<Phase>>(Phase::constructESModules),
+                0,
+                index,
+                0,
+                0,
+                0,
+                0,  //signifies no calling module
+                ctr.beginConstruction);
+            logFile->write(std::move(msg));
+            auto emsg = assembleMessage<Step::postESModule>(
+                static_cast<std::underlying_type_t<Phase>>(Phase::constructESModules),
+                0,
+                index,
+                0,
+                0,
+                0,
+                0,
+                ctr.endConstruction);
+            logFile->write(std::move(emsg));
+          }
+        }
+      }
+      {
         auto msg = assembleMessage<Step::postFrameworkTransition>(
             static_cast<std::underlying_type_t<Phase>>(Phase::constructESModules),
             0,
@@ -560,11 +623,13 @@ namespace edm::service::tracer {
         }
       };
       {
-        std::sort(moduleCtrDtrPtr->begin(), moduleCtrDtrPtr->end(), [](auto const& l, auto const& r) {
-          return l.beginConstruction < r.beginConstruction;
+        std::vector<int> indices(moduleCtrDtrPtr->size());
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&moduleCtrDtrPtr](int l, int r) {
+          return (*moduleCtrDtrPtr)[l].beginConstruction < (*moduleCtrDtrPtr)[r].beginConstruction;
         });
-        int id = 0;
-        for (auto const& ctr : *moduleCtrDtrPtr) {
+        for (auto id : indices) {
+          auto const& ctr = (*moduleCtrDtrPtr)[id];
           if (ctr.beginConstruction != 0) {
             handleSource(ctr.beginConstruction);
             auto bmsg = assembleMessage<Step::preModuleTransition>(
@@ -577,11 +642,12 @@ namespace edm::service::tracer {
           }
           ++id;
         }
-        id = 0;
-        std::sort(moduleCtrDtrPtr->begin(), moduleCtrDtrPtr->end(), [](auto const& l, auto const& r) {
-          return l.beginDestruction < r.beginDestruction;
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&moduleCtrDtrPtr](int l, int r) {
+          return (*moduleCtrDtrPtr)[l].beginDestruction < (*moduleCtrDtrPtr)[r].beginDestruction;
         });
-        for (auto const& dtr : *moduleCtrDtrPtr) {
+        for (auto id : indices) {
+          auto const& dtr = (*moduleCtrDtrPtr)[id];
           if (dtr.beginDestruction != 0) {
             handleSource(dtr.beginDestruction);
             auto bmsg = assembleMessage<Step::preModuleTransition>(
@@ -721,6 +787,31 @@ namespace edm::service::tracer {
       auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
       auto msg = assembleMessage<Step::postFrameworkTransition>(
           static_cast<std::underlying_type_t<Phase>>(Phase::endJob), 0, 0, 0, 0, t);
+      logFile->write(std::move(msg));
+    });
+
+    iRegistry.watchPreBeginStream([logFile, beginTime](auto const& sc) {
+      auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
+      auto msg = assembleMessage<Step::preFrameworkTransition>(
+          static_cast<std::underlying_type_t<Phase>>(Phase::beginStream), stream_id(sc), 0, 0, 0, t);
+      logFile->write(std::move(msg));
+    });
+    iRegistry.watchPostBeginStream([logFile, beginTime](auto const& sc) {
+      auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
+      auto msg = assembleMessage<Step::postFrameworkTransition>(
+          static_cast<std::underlying_type_t<Phase>>(Phase::beginStream), stream_id(sc), 0, 0, 0, t);
+      logFile->write(std::move(msg));
+    });
+    iRegistry.watchPreEndStream([logFile, beginTime](auto const& sc) {
+      auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
+      auto msg = assembleMessage<Step::preFrameworkTransition>(
+          static_cast<std::underlying_type_t<Phase>>(Phase::endStream), stream_id(sc), 0, 0, 0, t);
+      logFile->write(std::move(msg));
+    });
+    iRegistry.watchPostEndStream([logFile, beginTime](auto const& sc) {
+      auto const t = duration_cast<duration_t>(steady_clock::now() - beginTime).count();
+      auto msg = assembleMessage<Step::postFrameworkTransition>(
+          static_cast<std::underlying_type_t<Phase>>(Phase::endStream), stream_id(sc), 0, 0, 0, t);
       logFile->write(std::move(msg));
     });
 
